@@ -123,12 +123,17 @@ def get_conn():
         """
         CREATE TABLE IF NOT EXISTS chats (
             id          TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
             title       TEXT NOT NULL,
             created_at  TEXT NOT NULL,
             updated_at  TEXT NOT NULL
         )
         """
     )
+    # Migrate older DBs created before multi-user support existed
+    chat_cols = {row[1] for row in conn.execute("PRAGMA table_info(chats)")}
+    if "user_id" not in chat_cols:
+        conn.execute("ALTER TABLE chats ADD COLUMN user_id TEXT NOT NULL DEFAULT 'legacy'")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
@@ -157,27 +162,29 @@ def now():
     return datetime.now().isoformat(timespec="seconds")
 
 
-def create_chat(title="New chat"):
+def create_chat(user_id, title="New chat"):
     conn = get_conn()
     chat_id = str(uuid.uuid4())
     conn.execute(
-        "INSERT INTO chats (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        (chat_id, title, now(), now()),
+        "INSERT INTO chats (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, user_id, title, now(), now()),
     )
     conn.commit()
     return chat_id
 
 
-def list_chats(search=""):
+def list_chats(user_id, search=""):
     conn = get_conn()
     if search:
         rows = conn.execute(
-            "SELECT id, title, updated_at FROM chats WHERE title LIKE ? ORDER BY updated_at DESC",
-            (f"%{search}%",),
+            "SELECT id, title, updated_at FROM chats WHERE user_id = ? AND title LIKE ? "
+            "ORDER BY updated_at DESC",
+            (user_id, f"%{search}%"),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id, title, updated_at FROM chats ORDER BY updated_at DESC"
+            "SELECT id, title, updated_at FROM chats WHERE user_id = ? ORDER BY updated_at DESC",
+            (user_id,),
         ).fetchall()
     return rows
 
@@ -188,17 +195,19 @@ def rename_chat(chat_id, new_title):
     conn.commit()
 
 
-def delete_chat(chat_id):
+def delete_chat(chat_id, user_id):
     conn = get_conn()
     conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-    conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+    conn.execute("DELETE FROM chats WHERE id = ? AND user_id = ?", (chat_id, user_id))
     conn.commit()
 
 
-def delete_all_chats():
+def delete_all_chats(user_id):
     conn = get_conn()
-    conn.execute("DELETE FROM messages")
-    conn.execute("DELETE FROM chats")
+    ids = [r[0] for r in conn.execute("SELECT id FROM chats WHERE user_id = ?", (user_id,))]
+    for cid in ids:
+        conn.execute("DELETE FROM messages WHERE chat_id = ?", (cid,))
+    conn.execute("DELETE FROM chats WHERE user_id = ?", (user_id,))
     conn.commit()
 
 
@@ -341,11 +350,29 @@ def export_markdown(chat_id, title):
 
 
 # ----------------------------------------------------------------------------
+# Login gate
+# ----------------------------------------------------------------------------
+inject_css()
+
+if not st.user.is_logged_in:
+    st.markdown('<p class="hero-title">🚀 Start Your CS Journey</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="hero-subtitle">Master Computer Science & AI from Basics to Advanced Level</p>',
+        unsafe_allow_html=True,
+    )
+    st.write("Sign in to save your chats and pick up where you left off, on any device.")
+    if st.button("🔐  Continue with Google", type="primary"):
+        st.login("google")
+    st.stop()
+
+USER_ID = st.user.email
+
+# ----------------------------------------------------------------------------
 # State
 # ----------------------------------------------------------------------------
 if "chat_id" not in st.session_state:
-    chats = list_chats()
-    st.session_state.chat_id = chats[0][0] if chats else create_chat()
+    chats = list_chats(USER_ID)
+    st.session_state.chat_id = chats[0][0] if chats else create_chat(USER_ID)
 
 if "renaming" not in st.session_state:
     st.session_state.renaming = None
@@ -356,8 +383,6 @@ if "confirm_delete_all" not in st.session_state:
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
-inject_css()
-
 
 # ----------------------------------------------------------------------------
 # Sidebar
@@ -366,14 +391,21 @@ with st.sidebar:
     st.title("💻 CS & AI Mentor")
     st.caption("Created by **Ahsan Siddiqui**")
 
+    user_name = st.user.name or st.user.email
+    st.markdown(f"👋 **{user_name}**")
+    if st.button("🚪 Log out", use_container_width=True):
+        st.logout()
+
+    st.markdown("---")
+
     if st.button("➕  New chat", use_container_width=True, type="primary"):
-        st.session_state.chat_id = create_chat()
+        st.session_state.chat_id = create_chat(USER_ID)
         st.rerun()
 
     search = st.text_input("Search chats", placeholder="🔍 Search…", label_visibility="collapsed")
 
     st.markdown("##### Your chats")
-    chats = list_chats(search)
+    chats = list_chats(USER_ID, search)
 
     if not chats:
         st.caption("No chats yet.")
@@ -404,10 +436,10 @@ with st.sidebar:
                 st.session_state.renaming = chat_id
                 st.rerun()
             if col3.button("🗑️", key=f"del_{chat_id}", help="Delete"):
-                delete_chat(chat_id)
+                delete_chat(chat_id, USER_ID)
                 if st.session_state.chat_id == chat_id:
-                    remaining = list_chats()
-                    st.session_state.chat_id = remaining[0][0] if remaining else create_chat()
+                    remaining = list_chats(USER_ID)
+                    st.session_state.chat_id = remaining[0][0] if remaining else create_chat(USER_ID)
                 st.rerun()
 
     st.markdown("---")
@@ -422,7 +454,9 @@ with st.sidebar:
             """
         )
 
-    current_title = next((t for i, t, _ in list_chats() if i == st.session_state.chat_id), "chat")
+    current_title = next(
+        (t for i, t, _ in list_chats(USER_ID) if i == st.session_state.chat_id), "chat"
+    )
     st.download_button(
         "⬇️  Export this chat",
         data=export_markdown(st.session_state.chat_id, current_title),
@@ -439,8 +473,8 @@ with st.sidebar:
         st.warning("Delete every chat permanently?")
         c1, c2 = st.columns(2)
         if c1.button("Yes, delete", use_container_width=True):
-            delete_all_chats()
-            st.session_state.chat_id = create_chat()
+            delete_all_chats(USER_ID)
+            st.session_state.chat_id = create_chat(USER_ID)
             st.session_state.confirm_delete_all = False
             st.rerun()
         if c2.button("Cancel", use_container_width=True):
